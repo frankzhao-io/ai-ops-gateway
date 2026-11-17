@@ -1,0 +1,14 @@
+# Environment & secrets
+.env
+*.env
+
+# Python & test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime request traces & local dev notes
+data/traces.jsonl
+notes/
