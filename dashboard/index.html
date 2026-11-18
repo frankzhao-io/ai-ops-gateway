@@ -59,6 +59,16 @@
       <p id="heldout-note" style="margin:10px 0 0;font-size:0.86rem;color:var(--muted);"></p>
     </div>
 
+    <div id="concurrency-panel" class="panel" style="display:none;">
+      <h2>⚡ 併發負載與雲端溢流壓測（RTX 3080 Ollama · Local Queue vs. Semaphore Overflow）</h2>
+      <table>
+        <thead>
+          <tr><th>併發數 (N)</th><th>模式</th><th>總耗時 (Wall)</th><th>P50 延遲</th><th>P95 延遲</th><th>吞吐量 (RPS)</th><th>雲端溢流數</th><th>成本 ($)</th></tr>
+        </thead>
+        <tbody id="concurrency-rows"></tbody>
+      </table>
+    </div>
+
     <div class="panel">
       <h2>📊 流量路由分佈（Cost-Aware Tier Distribution）</h2>
       <div id="tier-bars"></div>
@@ -77,6 +87,7 @@
 
   <script src="eval-data.js"></script>
   <script src="heldout-data.js"></script>
+  <script src="concurrency-data.js"></script>
   <script>
     (function () {
       const r = window.EVAL_REPORT;
@@ -121,6 +132,23 @@
           </tr>
         `).join("");
         document.getElementById("heldout-note").textContent = `Held-Out 總成本節省：${h.cost_saved_pct}%（未見同義注入 HS06 與短問句 HQ01/HQ02 為已知 v1 規則邊界）`;
+      }
+
+      const cRep = window.CONCURRENCY_REPORT;
+      if (cRep && cRep.length) {
+        document.getElementById("concurrency-panel").style.display = "block";
+        document.getElementById("concurrency-rows").innerHTML = cRep.map((x) => `
+          <tr>
+            <td><strong>N=${x.concurrency}</strong></td>
+            <td><code>${x.mode}</code></td>
+            <td>${x.wall_ms} ms</td>
+            <td>${x.p50_ms} ms</td>
+            <td>${x.p95_ms} ms</td>
+            <td>${x.throughput_rps} req/s</td>
+            <td>${x.overflow_count}</td>
+            <td>$${x.total_cost_usd.toFixed(5)}</td>
+          </tr>
+        `).join("");
       }
 
       const colors = { tier0_deterministic:"var(--green)", tier1_local_7b:"var(--blue)", tier2_cloud_frontier:"var(--amber)", blocked:"var(--red)" };

@@ -45,10 +45,22 @@ Held-out cost dropped by **97.91%** (`$0.03189` -> `$0.00067`). Three cases fail
 - `HS06` used an unseen Chinese synonym (`前面`) not covered by the regex, so 1 of 6 held-out injections slipped through.
 - `HQ01` and `HQ02` (short questions about AdamW and vLLM PagedAttention) stayed on the 7B model because they did not trigger length or keyword rules, and the 7B answers missed the target concepts.
 
+### 3. Concurrency & cloud overflow (`src/run_concurrency_bench.py`)
+
+With `GatewayEngine.handle_async()` and `max_local_concurrency=1` (queue timeout `0.3s`), burst traffic exceeding local GPU capacity overflows to Tier-2 instead of queueing serially on a single RTX 3080 (warmed Ollama, uncached live calls):
+
+| Burst (`N`) | Mode | Wall Time | P50 Latency | P95 Latency | Throughput | Overflows | Cost (USD) |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| 4 | `Local_Queue_NoOverflow` | 9588.3 ms | 4617.8 ms | 9587.9 ms | 0.42 req/s | 0 | $0.00004 |
+| 4 | `Semaphore_Cloud_Overflow` | 2496.2 ms | 1149.6 ms | 2496.1 ms | 1.60 req/s | 3 | $0.00057 |
+| 6 | `Local_Queue_NoOverflow` | 14658.7 ms | 7194.9 ms | 14658.4 ms | 0.41 req/s | 0 | $0.00006 |
+| 6 | `Semaphore_Cloud_Overflow` | 2492.7 ms | 1402.0 ms | 2492.6 ms | 2.41 req/s | 5 | $0.00093 |
+
+At `N=6`, cloud overflow kept P95 flat at **2.49 s** (-83.0% vs. 14.66 s serial queueing) and raised throughput **5.9x** (`0.41` -> `2.41 req/s`).
+
 ## Known limitations
 
 - **Regex guardrails and keyword routing do not generalize to unseen paraphrases**, as `HS06`, `HQ01`, and `HQ02` showed. The next step is pairing the fast regex pre-filter with a lightweight classifier or secondary check on borderline inputs.
-- **Synchronous FastAPI handler**: `src/gateway.py` runs synchronously. Under concurrent load on a single GPU, an async handler with an in-flight semaphore and cloud overflow would be needed to keep tail latency bounded.
 - **Token pricing**: Tier-1 cost uses an approximate `$0.00015 / 1k tokens` infra estimate; Tier-0 is `$0`.
 
 ## Running locally
@@ -57,7 +69,7 @@ Held-out cost dropped by **97.91%** (`$0.03189` -> `$0.00067`). Three cases fail
 git clone https://github.com/frankzhao-io/ai-ops-gateway.git
 cd ai-ops-gateway
 
-# Unit and regression tests (offline mock backend, 10 tests)
+# Unit and regression tests (offline mock backend, 11 tests)
 python -m pytest -v
 
 # Offline CI smoke run (writes dashboard/eval-data.js)
@@ -66,6 +78,7 @@ python -m src.eval_ci
 # Live runs (requires local Ollama with qwen2.5-coder:7b and GEMINI_API_KEY)
 python -m src.run_ablation_live
 python -m src.run_heldout_and_latency
+python -m src.run_concurrency_bench
 ```
 
 Open `dashboard/index.html` in a browser to inspect the dev and held-out tables alongside per-case results.

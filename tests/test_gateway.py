@@ -1,5 +1,8 @@
 """Unit and integration tests for AI Ops Gateway."""
 
+import asyncio
+import time
+
 from src.backends import BackendResult
 from src.eval_ci import run_eval
 from src.gateway import ChatRequest, GatewayEngine
@@ -111,3 +114,35 @@ def test_output_guardrail_redacts_leaked_secret():
     assert "sk-SecretKey1234567890" not in resp.answer
     assert "[REDACTED_API_KEY]" in resp.answer
     assert "API_KEY" in resp.pii_redacted
+
+
+def test_async_semaphore_overflows_to_cloud_when_local_gpu_busy():
+    def slow_local_fast_cloud(prompt, tier, require_json, required_keys):
+        if tier == ModelTier.TIER_1_LOCAL_7B:
+            time.sleep(0.25)
+            return BackendResult(text="local_ok", prompt_tokens=20, completion_tokens=10, latency_ms=250.0)
+        time.sleep(0.03)
+        return BackendResult(text="cloud_overflow_ok", prompt_tokens=20, completion_tokens=10, latency_ms=30.0)
+
+    engine = GatewayEngine(
+        backend_fn=slow_local_fast_cloud,
+        trace_path=None,
+        max_local_concurrency=1,
+        queue_timeout_sec=0.05,
+    )
+
+    async def run_burst():
+        t0 = time.perf_counter()
+        resps = await asyncio.gather(
+            engine.handle_async(ChatRequest(prompt="Short task 1")),
+            engine.handle_async(ChatRequest(prompt="Short task 2")),
+            engine.handle_async(ChatRequest(prompt="Short task 3")),
+        )
+        return resps, time.perf_counter() - t0
+
+    responses, wall_sec = asyncio.run(run_burst())
+    local_count = sum(1 for r in responses if r.tier_used == ModelTier.TIER_1_LOCAL_7B.value)
+    overflow_count = sum(1 for r in responses if r.overflowed)
+    assert local_count == 1
+    assert overflow_count == 2
+    assert wall_sec < 0.55  # Bounded tail latency instead of 0.75s serial queueing

@@ -37,7 +37,7 @@ window.EVAL_REPORT = {
       "passed": true,
       "tier_used": "tier0_deterministic",
       "cost_usd": 0.0,
-      "latency_ms": 0.058,
+      "latency_ms": 0.055,
       "status": "ok",
       "escalated": false
     },
@@ -47,7 +47,7 @@ window.EVAL_REPORT = {
       "passed": true,
       "tier_used": "tier0_deterministic",
       "cost_usd": 0.0,
-      "latency_ms": 0.033,
+      "latency_ms": 0.032,
       "status": "ok",
       "escalated": false
     },
@@ -57,7 +57,7 @@ window.EVAL_REPORT = {
       "passed": true,
       "tier_used": "tier0_deterministic",
       "cost_usd": 0.0,
-      "latency_ms": 0.019,
+      "latency_ms": 0.018,
       "status": "ok",
       "escalated": false
     },

@@ -1,5 +1,6 @@
 """Unified AI Ops Gateway: Guardrails -> Router -> Live/Mock Execution + Circuit Breaker -> Telemetry."""
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -36,6 +37,7 @@ class ChatResponse(BaseModel):
     tier_used: Optional[str] = None
     route_reason: Optional[str] = None
     escalated: bool = False
+    overflowed: bool = False
     pii_redacted: List[str] = Field(default_factory=list)
     block_reason: Optional[str] = None
     prompt_tokens: int = 0
@@ -87,6 +89,8 @@ class GatewayEngine:
         backend_fn: Optional[Callable[[str, ModelTier, bool, Optional[List[str]]], Any]] = None,
         live: bool = False,
         trace_path: Optional[Path] = DEFAULT_TRACE_PATH,
+        max_local_concurrency: int = 2,
+        queue_timeout_sec: float = 0.25,
     ):
         if backend_fn is not None:
             self.backend_fn = backend_fn
@@ -95,6 +99,9 @@ class GatewayEngine:
         else:
             self.backend_fn = _default_simulator
         self.trace_path = trace_path
+        self.max_local_concurrency = max_local_concurrency
+        self.queue_timeout_sec = queue_timeout_sec
+        self._local_sem: Optional[asyncio.Semaphore] = None
 
     def _write_trace(self, resp: ChatResponse) -> None:
         if not self.trace_path:
@@ -233,6 +240,141 @@ class GatewayEngine:
         self._write_trace(resp)
         return resp
 
+    async def handle_async(self, req: ChatRequest) -> ChatResponse:
+        """Async request handler with local GPU concurrency semaphore and cloud overflow."""
+        t0 = time.perf_counter()
+        guard = inspect_input(req.prompt)
+        if guard.blocked:
+            resp = ChatResponse(
+                status="blocked",
+                answer="Request blocked by security guardrail.",
+                block_reason=guard.block_reason,
+                latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+            )
+            self._write_trace(resp)
+            return resp
+
+        decision = route_request(guard.sanitized_prompt, require_json=req.require_json)
+        tier = req.force_tier or decision.tier
+        reason = "FORCED_TIER" if req.force_tier else decision.reason
+
+        if tier == ModelTier.TIER_0_RULE and decision.deterministic_answer is not None:
+            resp = ChatResponse(
+                status="ok",
+                answer=decision.deterministic_answer,
+                tier_used=tier.value,
+                route_reason=reason,
+                pii_redacted=guard.pii_redacted,
+                latency_ms=round((time.perf_counter() - t0) * 1000, 3),
+            )
+            self._write_trace(resp)
+            return resp
+
+        overflowed = False
+        acquired_local = False
+        if self._local_sem is None:
+            self._local_sem = asyncio.Semaphore(self.max_local_concurrency)
+
+        if tier == ModelTier.TIER_1_LOCAL_7B:
+            try:
+                await asyncio.wait_for(self._local_sem.acquire(), timeout=self.queue_timeout_sec)
+                acquired_local = True
+            except asyncio.TimeoutError:
+                if req.force_tier is None and req.allow_escalation:
+                    overflowed = True
+                    tier = ModelTier.TIER_2_CLOUD
+                    reason = f"{reason}->OVERFLOW_CLOUD_QUEUE_FULL"
+                else:
+                    await self._local_sem.acquire()
+                    acquired_local = True
+
+        try:
+            res = _normalize_result(
+                await asyncio.to_thread(
+                    self.backend_fn, guard.sanitized_prompt, tier, req.require_json, req.required_keys
+                ),
+                guard.sanitized_prompt,
+                tier,
+            )
+        finally:
+            if acquired_local:
+                self._local_sem.release()
+
+        escalated = False
+        total_p_tok = res.prompt_tokens
+        total_c_tok = res.completion_tokens
+        total_cost = ((total_p_tok + total_c_tok) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
+
+        if res.error and tier == ModelTier.TIER_1_LOCAL_7B and req.allow_escalation:
+            escalated = True
+            tier = ModelTier.TIER_2_CLOUD
+            reason = f"{reason}->FALLBACK_TIER1_ERROR"
+            res = _normalize_result(
+                await asyncio.to_thread(
+                    self.backend_fn, guard.sanitized_prompt, tier, req.require_json, req.required_keys
+                ),
+                guard.sanitized_prompt,
+                tier,
+            )
+            total_p_tok += res.prompt_tokens
+            total_c_tok += res.completion_tokens
+            total_cost += ((res.prompt_tokens + res.completion_tokens) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
+
+        if res.error:
+            resp = ChatResponse(
+                status="error",
+                answer=res.error,
+                tier_used=tier.value,
+                route_reason=reason,
+                escalated=escalated,
+                overflowed=overflowed,
+                pii_redacted=guard.pii_redacted,
+                latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+            )
+            self._write_trace(resp)
+            return resp
+
+        output = strip_json_fences(res.text) if req.require_json else res.text
+        if req.require_json:
+            valid, _ = validate_json_output(output, req.required_keys)
+            if not valid and req.allow_escalation and tier == ModelTier.TIER_1_LOCAL_7B:
+                escalated = True
+                tier = ModelTier.TIER_2_CLOUD
+                reason = f"{reason}->ESCALATED_SCHEMA_FAIL"
+                esc_res = _normalize_result(
+                    await asyncio.to_thread(
+                        self.backend_fn, guard.sanitized_prompt, tier, req.require_json, req.required_keys
+                    ),
+                    guard.sanitized_prompt,
+                    tier,
+                )
+                if not esc_res.error:
+                    output = strip_json_fences(esc_res.text)
+                    total_p_tok += esc_res.prompt_tokens
+                    total_c_tok += esc_res.completion_tokens
+                    total_cost += ((esc_res.prompt_tokens + esc_res.completion_tokens) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
+
+        output, out_pii = inspect_output(output)
+        all_pii = sorted(set(guard.pii_redacted + out_pii))
+
+        resp = ChatResponse(
+            status="ok",
+            answer=output,
+            tier_used=tier.value,
+            route_reason=reason,
+            escalated=escalated,
+            overflowed=overflowed,
+            pii_redacted=all_pii,
+            prompt_tokens=total_p_tok,
+            completion_tokens=total_c_tok,
+            tokens_estimated=total_p_tok + total_c_tok,
+            cost_usd=round(total_cost, 6),
+            latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+            cached=res.cached,
+        )
+        self._write_trace(resp)
+        return resp
+
 
 app = FastAPI(title="AI Ops Gateway", version="0.2.0")
 _engine = GatewayEngine()
@@ -244,5 +386,5 @@ def health() -> Dict[str, str]:
 
 
 @app.post("/v1/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
-    return _engine.handle(req)
+async def chat(req: ChatRequest) -> ChatResponse:
+    return await _engine.handle_async(req)
