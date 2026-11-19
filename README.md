@@ -1,5 +1,7 @@
 # ai-ops-gateway
 
+[![CI](https://github.com/frankzhao-io/ai-ops-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/frankzhao-io/ai-ops-gateway/actions/workflows/ci.yml)
+
 A lightweight routing and guardrail gateway for mixing deterministic checks, a local 7B model (`qwen2.5-coder:7b` via Ollama), and a cloud model (`gemini-3.5-flash-lite`) behind a single `/v1/chat` interface.
 
 The goal is practical: avoid sending arithmetic, malformed inputs, or routine extraction tasks to a paid cloud API, while keeping a fallback path when the local model fails or times out.
