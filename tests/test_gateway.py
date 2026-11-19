@@ -57,7 +57,7 @@ def test_schema_failure_escalates_tier1_to_tier2():
 
 
 def test_eval_ci_passes_all_golden_cases():
-    report = run_eval()
+    report = run_eval(write_dashboard=False)
     assert report["gated"]["pass_rate"] == 1.0
     assert report["cost_saved_pct"] > 0.0
 

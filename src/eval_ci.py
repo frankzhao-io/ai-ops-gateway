@@ -93,7 +93,7 @@ def summarize_arm(name: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def run_eval(live: bool = False) -> Dict[str, Any]:
+def run_eval(live: bool = False, write_dashboard: bool = True) -> Dict[str, Any]:
     cases = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
     engine = GatewayEngine(live=live, trace_path=None)
 
@@ -118,11 +118,12 @@ def run_eval(live: bool = False) -> Dict[str, Any]:
         "cases": gated_rows,
     }
 
-    DASHBOARD_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DASHBOARD_DATA_PATH.write_text(
-        f"window.EVAL_REPORT = {json.dumps(report, ensure_ascii=False, indent=2)};\n",
-        encoding="utf-8",
-    )
+    if write_dashboard:
+        DASHBOARD_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DASHBOARD_DATA_PATH.write_text(
+            f"window.EVAL_REPORT = {json.dumps(report, ensure_ascii=False, indent=2)};\n",
+            encoding="utf-8",
+        )
     return report
 
 
