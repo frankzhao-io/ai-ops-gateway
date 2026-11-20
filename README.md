@@ -71,7 +71,7 @@ At `N=6`, cloud overflow kept P95 flat at **2.49 s** (-83.0% vs. 14.66 s serial 
 git clone https://github.com/frankzhao-io/ai-ops-gateway.git
 cd ai-ops-gateway
 
-# Unit and regression tests (offline mock backend, 11 tests)
+# Unit and regression tests (offline mock backend, 12 tests)
 python -m pytest -v
 
 # Offline CI smoke run (writes dashboard/eval-data.js)
@@ -81,6 +81,33 @@ python -m src.eval_ci
 python -m src.run_ablation_live
 python -m src.run_heldout_and_latency
 python -m src.run_concurrency_bench
+```
+
+### OpenAI-Compatible API & Docker Deployment
+
+Start the FastAPI gateway locally (simulator mode by default, or set `AI_OPS_LIVE=1` for live Ollama + Gemini):
+
+```powershell
+uvicorn src.gateway:app --host 0.0.0.0 --port 8000
+```
+
+Or run with Docker Compose:
+
+```powershell
+docker compose up --build
+```
+
+Drop-in OpenAI Python SDK / `curl` usage (`POST /v1/chat/completions`, `GET /v1/models`, `GET /metrics`, `GET /health`):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-dev")
+resp = client.chat.completions.create(
+    model="auto",  # or "tier-0-ast", "tier-1-local-7b", "tier-2-cloud"
+    messages=[{"role": "user", "content": "125 * 48 + 300"}],
+)
+print(resp.choices[0].message.content)
 ```
 
 Open `dashboard/index.html` in a browser to inspect the dev and held-out tables alongside per-case results.

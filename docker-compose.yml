@@ -1,0 +1,14 @@
+services:
+  gateway:
+    build: .
+    container_name: ai-ops-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - AI_OPS_LIVE=${AI_OPS_LIVE:-0}
+      - AI_OPS_MAX_LOCAL_CONCURRENCY=${AI_OPS_MAX_LOCAL_CONCURRENCY:-2}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

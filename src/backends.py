@@ -29,16 +29,17 @@ class BackendResult:
 
 
 def load_gemini_api_key() -> Optional[str]:
-    """Load GEMINI_API_KEY from environment or sibling track3-ai4science/.env."""
+    """Load GEMINI_API_KEY from environment or sibling grounded-chart-audit/.env."""
     if os.environ.get("GEMINI_API_KEY"):
         return os.environ["GEMINI_API_KEY"].strip()
-    env_file = WORKSPACE_ROOT / "track3-ai4science" / ".env"
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("GEMINI_API_KEY="):
-                val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                if val:
-                    return val
+    for folder in ("grounded-chart-audit", "track3-ai4science"):
+        env_file = WORKSPACE_ROOT / folder / ".env"
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("GEMINI_API_KEY="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val
     return None
 
 
@@ -52,12 +53,13 @@ def _build_json_instruction(prompt: str, required_keys: Optional[List[str]]) -> 
 def call_ollama(
     prompt: str,
     model: str = "qwen2.5-coder:7b",
-    base_url: str = "http://localhost:11434",
+    base_url: Optional[str] = None,
     require_json: bool = False,
     required_keys: Optional[List[str]] = None,
     timeout_sec: float = 30.0,
 ) -> BackendResult:
     """Call local Ollama chat API and return exact token counts and wall-clock latency."""
+    resolved_url = (base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
     t0 = time.perf_counter()
     final_prompt = _build_json_instruction(prompt, required_keys) if require_json else prompt
     payload: Dict = {
@@ -70,7 +72,7 @@ def call_ollama(
         payload["format"] = "json"
 
     try:
-        resp = requests.post(f"{base_url.rstrip('/')}/api/chat", json=payload, timeout=timeout_sec)
+        resp = requests.post(f"{resolved_url}/api/chat", json=payload, timeout=timeout_sec)
         resp.raise_for_status()
         data = resp.json()
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)

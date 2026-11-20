@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from src.backends import BackendResult, CachedLiveBackend
 from src.guardrails import inspect_input, inspect_output, strip_json_fences, validate_json_output
+from src.openai_compat import GatewayMetrics, create_openai_router
 from src.router import (
     TIER_BASE_LATENCY_MS,
     TIER_PRICING_PER_1K_TOKENS,
@@ -376,15 +378,26 @@ class GatewayEngine:
         return resp
 
 
-app = FastAPI(title="AI Ops Gateway", version="0.2.0")
-_engine = GatewayEngine()
+app = FastAPI(title="AI Ops Gateway", version="0.3.0")
+_live_mode = os.environ.get("AI_OPS_LIVE", "").strip() == "1"
+_max_local = int(os.environ.get("AI_OPS_MAX_LOCAL_CONCURRENCY", "2"))
+_engine = GatewayEngine(live=_live_mode, max_local_concurrency=_max_local)
+_metrics = GatewayMetrics()
+
+app.include_router(create_openai_router(lambda: _engine, _metrics))
 
 
 @app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "healthy"}
+def health() -> Dict[str, Any]:
+    return {
+        "status": "healthy",
+        "mode": "live" if _live_mode else "simulator",
+        "max_local_concurrency": _max_local,
+    }
 
 
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    return await _engine.handle_async(req)
+    resp = await _engine.handle_async(req)
+    _metrics.record(resp)
+    return resp
