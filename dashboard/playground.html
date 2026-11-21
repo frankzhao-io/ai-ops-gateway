@@ -597,6 +597,14 @@
       }
     }
 
+    function esc(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
     function setStatus(state, text, metaHtml = "") {
       const dot = document.getElementById("status-dot");
       dot.className = "dot " + state;
@@ -616,78 +624,88 @@
 
       const payload = { model, stream, messages: [{ role: "user", content: prompt }] };
 
-      if (!stream) {
+      try {
+        if (!stream) {
+          const res = await fetch("/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          rawEl.textContent = JSON.stringify(data, null, 2);
+
+          if (!res.ok) {
+            setStatus(
+              "err",
+              `${t.blockedPrefix} (HTTP ${res.status})`,
+              `<span>${esc(t.reasonLabel)}: <strong class="mono">${esc(data.error?.code || "error")}</strong></span>`
+            );
+            answerEl.textContent = data.error?.message || "Blocked";
+          } else {
+            const xg = data.x_gateway || {};
+            const pii = (xg.pii_redacted && xg.pii_redacted.length) ? xg.pii_redacted.join(", ") : t.none;
+            setStatus(
+              "ok",
+              t.okPrefix,
+              `<span>${esc(t.tierLabel)}: <strong class="mono">${esc(xg.tier_used)}</strong></span>` +
+              `<span>${esc(t.reasonLabel)}: <strong class="mono">${esc(xg.route_reason)}</strong></span>` +
+              `<span>${esc(t.piiLabel)}: <strong>${esc(pii)}</strong></span>` +
+              `<span>${esc(t.costLabel)}: <strong>$${esc(xg.cost_usd)}</strong></span>` +
+              `<span>${esc(t.latLabel)}: <strong>${esc(xg.latency_ms)} ms</strong></span>`
+            );
+            answerEl.textContent = data.choices?.[0]?.message?.content || "";
+          }
+          refreshMetrics();
+          return;
+        }
+
         const res = await fetch("/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         });
-        const data = await res.json();
-        rawEl.textContent = JSON.stringify(data, null, 2);
 
         if (!res.ok) {
-          setStatus(
-            "err",
-            `${t.blockedPrefix} (HTTP ${res.status})`,
-            `<span>${t.reasonLabel}: <strong class="mono">${data.error?.code || "error"}</strong></span>`
-          );
-          answerEl.textContent = data.error?.message || "Blocked";
-        } else {
-          const xg = data.x_gateway || {};
-          const pii = (xg.pii_redacted && xg.pii_redacted.length) ? xg.pii_redacted.join(", ") : t.none;
-          setStatus(
-            "ok",
-            t.okPrefix,
-            `<span>${t.tierLabel}: <strong class="mono">${xg.tier_used}</strong></span>` +
-            `<span>${t.reasonLabel}: <strong class="mono">${xg.route_reason}</strong></span>` +
-            `<span>${t.piiLabel}: <strong>${pii}</strong></span>` +
-            `<span>${t.costLabel}: <strong>$${xg.cost_usd}</strong></span>` +
-            `<span>${t.latLabel}: <strong>${xg.latency_ms} ms</strong></span>`
-          );
-          answerEl.textContent = data.choices?.[0]?.message?.content || "";
+          const err = await res.json();
+          rawEl.textContent = JSON.stringify(err, null, 2);
+          setStatus("err", `${t.blockedPrefix} (HTTP ${res.status})`, "");
+          answerEl.textContent = err.error?.message || "Blocked";
+          refreshMetrics();
+          return;
         }
-        refreshMetrics();
-        return;
-      }
 
-      const res = await fetch("/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        rawEl.textContent = JSON.stringify(err, null, 2);
-        setStatus("err", `${t.blockedPrefix} (HTTP ${res.status})`, "");
-        answerEl.textContent = err.error?.message || "Blocked";
-        refreshMetrics();
-        return;
-      }
-
-      setStatus("warn", t.streaming, "");
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let rawLog = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        const text = decoder.decode(value, { stream: true });
-        rawLog += text;
-        for (const line of text.split("\n")) {
-          if (!line.startsWith("data:")) continue;
+        setStatus("warn", t.streaming, "");
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let rawLog = "";
+        let lineBuf = "";
+        const handleLine = (line) => {
+          if (!line.startsWith("data:")) return;
           const body = line.slice(5).trim();
-          if (body === "[DONE]") continue;
+          if (body === "[DONE]") return;
           try {
             const obj = JSON.parse(body);
             const delta = obj.choices?.[0]?.delta?.content;
             if (delta) answerEl.textContent += delta;
           } catch {}
+        };
+        while (true) {
+          const { value, done } = await reader.read();
+          const text = done ? decoder.decode() : decoder.decode(value, { stream: true });
+          rawLog += text;
+          lineBuf += text;
+          const lines = lineBuf.split("\n");
+          lineBuf = done ? "" : (lines.pop() || "");
+          for (const line of lines) handleLine(line);
+          if (done) break;
         }
+        rawEl.textContent = rawLog.trim();
+        setStatus("ok", t.streamDone, "");
+        refreshMetrics();
+      } catch (err) {
+        setStatus("err", "Request failed", "");
+        answerEl.textContent = String(err);
       }
-      rawEl.textContent = rawLog.trim();
-      setStatus("ok", t.streamDone, "");
-      refreshMetrics();
     }
 
     setLang("en");
