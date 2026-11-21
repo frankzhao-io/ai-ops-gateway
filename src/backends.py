@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import requests
 
@@ -51,6 +51,70 @@ def _build_json_instruction(prompt: str, required_keys: Optional[List[str]]) -> 
     return f"{prompt}\n\nReturn ONLY a valid JSON object containing these keys: {keys_str}."
 
 
+def _format_ollama_messages(
+    prompt: str,
+    messages: Optional[List[Dict[str, str]]],
+    require_json: bool,
+    required_keys: Optional[List[str]],
+) -> List[Dict[str, str]]:
+    if not messages:
+        final_prompt = _build_json_instruction(prompt, required_keys) if require_json else prompt
+        return [{"role": "user", "content": final_prompt}]
+    out = [dict(m) for m in messages]
+    if require_json and out:
+        for i in range(len(out) - 1, -1, -1):
+            if out[i].get("role") == "user":
+                out[i]["content"] = _build_json_instruction(out[i]["content"], required_keys)
+                break
+    return out
+
+
+def _format_gemini_payload(
+    prompt: str,
+    messages: Optional[List[Dict[str, str]]],
+    require_json: bool,
+    required_keys: Optional[List[str]],
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+) -> Dict:
+    gen_cfg: Dict = {
+        "temperature": 0.0 if temperature is None else float(temperature),
+        "maxOutputTokens": 1024 if max_tokens is None else int(max_tokens),
+    }
+    if require_json:
+        gen_cfg["responseMimeType"] = "application/json"
+
+    if not messages:
+        final_prompt = _build_json_instruction(prompt, required_keys) if require_json else prompt
+        return {"contents": [{"parts": [{"text": final_prompt}]}], "generationConfig": gen_cfg}
+
+    system_parts: List[str] = []
+    contents: List[Dict] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "system":
+            system_parts.append(content)
+        else:
+            gem_role = "model" if role == "assistant" else "user"
+            contents.append({"role": gem_role, "parts": [{"text": content}]})
+
+    if not contents:
+        contents = [{"role": "user", "parts": [{"text": prompt}]}]
+    if require_json:
+        for i in range(len(contents) - 1, -1, -1):
+            if contents[i]["role"] == "user":
+                contents[i]["parts"][0]["text"] = _build_json_instruction(
+                    contents[i]["parts"][0]["text"], required_keys
+                )
+                break
+
+    payload: Dict = {"contents": contents, "generationConfig": gen_cfg}
+    if system_parts:
+        payload["systemInstruction"] = {"parts": [{"text": "\n".join(system_parts)}]}
+    return payload
+
+
 def call_ollama(
     prompt: str,
     model: str = "qwen2.5-coder:7b",
@@ -58,16 +122,21 @@ def call_ollama(
     require_json: bool = False,
     required_keys: Optional[List[str]] = None,
     timeout_sec: float = 30.0,
+    messages: Optional[List[Dict[str, str]]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
 ) -> BackendResult:
     """Call local Ollama chat API and return exact token counts and wall-clock latency."""
     resolved_url = (base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
     t0 = time.perf_counter()
-    final_prompt = _build_json_instruction(prompt, required_keys) if require_json else prompt
+    options: Dict = {"temperature": 0.0 if temperature is None else float(temperature)}
+    if max_tokens is not None:
+        options["num_predict"] = int(max_tokens)
     payload: Dict = {
         "model": model,
-        "messages": [{"role": "user", "content": final_prompt}],
+        "messages": _format_ollama_messages(prompt, messages, require_json, required_keys),
         "stream": False,
-        "options": {"temperature": 0.0},
+        "options": options,
     }
     if require_json:
         payload["format"] = "json"
@@ -96,21 +165,17 @@ def call_gemini(
     required_keys: Optional[List[str]] = None,
     timeout_sec: float = 30.0,
     max_retries: int = 3,
+    messages: Optional[List[Dict[str, str]]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
 ) -> BackendResult:
     """Call Gemini REST API with 429/503 exponential backoff and exact usageMetadata."""
     key = api_key or load_gemini_api_key()
     if not key:
         return BackendResult(text="", error="GEMINI_API_KEY_MISSING")
 
-    final_prompt = _build_json_instruction(prompt, required_keys) if require_json else prompt
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    gen_cfg: Dict = {"temperature": 0.0, "maxOutputTokens": 1024}
-    if require_json:
-        gen_cfg["responseMimeType"] = "application/json"
-    payload = {
-        "contents": [{"parts": [{"text": final_prompt}]}],
-        "generationConfig": gen_cfg,
-    }
+    payload = _format_gemini_payload(prompt, messages, require_json, required_keys, temperature, max_tokens)
 
     t0 = time.perf_counter()
     last_err = "UNKNOWN"
@@ -139,6 +204,89 @@ def call_gemini(
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
     return BackendResult(text="", latency_ms=elapsed_ms, error=f"GEMINI_ERROR:{last_err}")
+
+
+def stream_ollama(
+    prompt: str,
+    model: str = "qwen2.5-coder:7b",
+    base_url: Optional[str] = None,
+    require_json: bool = False,
+    required_keys: Optional[List[str]] = None,
+    timeout_sec: float = 60.0,
+    messages: Optional[List[Dict[str, str]]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> Iterator[Tuple[str, Optional[Dict[str, int]]]]:
+    """Yield incremental token chunks from Ollama's NDJSON streaming API."""
+    resolved_url = (base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
+    options: Dict = {"temperature": 0.0 if temperature is None else float(temperature)}
+    if max_tokens is not None:
+        options["num_predict"] = int(max_tokens)
+    payload: Dict = {
+        "model": model,
+        "messages": _format_ollama_messages(prompt, messages, require_json, required_keys),
+        "stream": True,
+        "options": options,
+    }
+    if require_json:
+        payload["format"] = "json"
+    with requests.post(f"{resolved_url}/api/chat", json=payload, stream=True, timeout=timeout_sec) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            chunk = json.loads(line)
+            piece = chunk.get("message", {}).get("content", "")
+            usage = None
+            if chunk.get("done"):
+                usage = {
+                    "prompt_tokens": int(chunk.get("prompt_eval_count", 0)),
+                    "completion_tokens": int(chunk.get("eval_count", 0)),
+                }
+            if piece or usage:
+                yield piece, usage
+
+
+def stream_gemini(
+    prompt: str,
+    model: str = "gemini-3.5-flash-lite",
+    api_key: Optional[str] = None,
+    require_json: bool = False,
+    required_keys: Optional[List[str]] = None,
+    timeout_sec: float = 60.0,
+    messages: Optional[List[Dict[str, str]]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> Iterator[Tuple[str, Optional[Dict[str, int]]]]:
+    """Yield incremental token chunks from Gemini's SSE streaming endpoint."""
+    key = api_key or load_gemini_api_key()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY_MISSING")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}"
+    payload = _format_gemini_payload(prompt, messages, require_json, required_keys, temperature, max_tokens)
+    with requests.post(url, json=payload, stream=True, timeout=timeout_sec) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            data = json.loads(raw)
+            candidates = data.get("candidates") or []
+            piece = ""
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts") or []
+                piece = "".join(p.get("text", "") for p in parts)
+            usage_meta = data.get("usageMetadata")
+            usage = None
+            if usage_meta:
+                usage = {
+                    "prompt_tokens": int(usage_meta.get("promptTokenCount", 0)),
+                    "completion_tokens": int(usage_meta.get("candidatesTokenCount", 0)),
+                }
+            if piece or usage:
+                yield piece, usage
 
 
 class CachedLiveBackend:
@@ -184,19 +332,46 @@ class CachedLiveBackend:
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
-    def __call__(self, prompt: str, tier: ModelTier, require_json: bool, required_keys: Optional[List[str]]) -> BackendResult:
+    def __call__(
+        self,
+        prompt: str,
+        tier: ModelTier,
+        require_json: bool,
+        required_keys: Optional[List[str]],
+        messages: Optional[List[Dict[str, str]]] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> BackendResult:
+        # Bypass cache when non-deterministic temperature or multi-turn history is provided
+        cacheable = self.use_cache and not messages and (temperature is None or temperature == 0.0) and max_tokens is None
         key = self._make_key(prompt, tier, require_json, required_keys)
-        if self.use_cache:
+        if cacheable:
             with self._lock:
                 if key in self._cache:
                     return self._cache[key]
 
         if tier == ModelTier.TIER_1_LOCAL_7B:
-            res = call_ollama(prompt, model=self.ollama_model, require_json=require_json, required_keys=required_keys)
+            res = call_ollama(
+                prompt,
+                model=self.ollama_model,
+                require_json=require_json,
+                required_keys=required_keys,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
         else:
-            res = call_gemini(prompt, model=self.gemini_model, require_json=require_json, required_keys=required_keys)
+            res = call_gemini(
+                prompt,
+                model=self.gemini_model,
+                require_json=require_json,
+                required_keys=required_keys,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
-        if self.use_cache and not res.error:
+        if cacheable and not res.error:
             record = {
                 "key": key,
                 "tier": tier.value,

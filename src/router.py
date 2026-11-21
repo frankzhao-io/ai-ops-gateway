@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from src.semantic_router import classify_semantic_difficulty
+
 
 class ModelTier(str, Enum):
     TIER_0_RULE = "tier0_deterministic"
@@ -71,9 +73,10 @@ class RouteDecision:
     tier: ModelTier
     reason: str
     deterministic_answer: Optional[str] = None
+    difficulty_score: float = 0.0
 
 
-def route_request(prompt: str, require_json: bool = False) -> RouteDecision:
+def route_request(prompt: str, require_json: bool = False, use_semantic: bool = True) -> RouteDecision:
     """Select the cheapest tier capable of handling the prompt reliably."""
     det_answer = try_deterministic_solve(prompt)
     if det_answer is not None and not require_json:
@@ -87,7 +90,17 @@ def route_request(prompt: str, require_json: bool = False) -> RouteDecision:
         return RouteDecision(
             tier=ModelTier.TIER_2_CLOUD,
             reason="HIGH_COMPLEXITY_OR_LONG_CONTEXT",
+            difficulty_score=1.0,
         )
+
+    if use_semantic:
+        is_hard, margin = classify_semantic_difficulty(prompt)
+        if is_hard:
+            return RouteDecision(
+                tier=ModelTier.TIER_2_CLOUD,
+                reason="SEMANTIC_HIGH_DIFFICULTY",
+                difficulty_score=margin,
+            )
 
     return RouteDecision(
         tier=ModelTier.TIER_1_LOCAL_7B,

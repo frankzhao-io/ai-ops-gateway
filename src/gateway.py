@@ -11,7 +11,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from src.backends import BackendResult, CachedLiveBackend
+from src.auth_quota import TenantQuotaManager
+from src.backends import BackendResult, CachedLiveBackend, stream_gemini, stream_ollama
 from src.guardrails import inspect_input, inspect_output, strip_json_fences, validate_json_output
 from src.openai_compat import GatewayMetrics, create_openai_router
 from src.router import (
@@ -28,6 +29,9 @@ DEFAULT_TRACE_PATH = ROOT / "data" / "traces.jsonl"
 
 class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
+    messages: Optional[List[Dict[str, str]]] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
     require_json: bool = False
     required_keys: Optional[List[str]] = None
     force_tier: Optional[ModelTier] = None
@@ -107,6 +111,19 @@ class GatewayEngine:
         self._local_sem: Optional[asyncio.Semaphore] = None
         self._sem_loop: Optional[asyncio.AbstractEventLoop] = None
         self._trace_lock = threading.Lock()
+
+    def _call_backend(self, prompt: str, tier: ModelTier, req: ChatRequest) -> Any:
+        if isinstance(self.backend_fn, CachedLiveBackend):
+            return self.backend_fn(
+                prompt,
+                tier,
+                req.require_json,
+                req.required_keys,
+                messages=req.messages,
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+            )
+        return self.backend_fn(prompt, tier, req.require_json, req.required_keys)
 
     def _write_trace(self, resp: ChatResponse) -> None:
         if not self.trace_path:
@@ -298,9 +315,7 @@ class GatewayEngine:
 
         try:
             res = _normalize_result(
-                await asyncio.to_thread(
-                    self.backend_fn, guard.sanitized_prompt, tier, req.require_json, req.required_keys
-                ),
+                await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req),
                 guard.sanitized_prompt,
                 tier,
             )
@@ -319,9 +334,7 @@ class GatewayEngine:
             tier = ModelTier.TIER_2_CLOUD
             reason = f"{reason}->FALLBACK_TIER1_ERROR"
             res = _normalize_result(
-                await asyncio.to_thread(
-                    self.backend_fn, guard.sanitized_prompt, tier, req.require_json, req.required_keys
-                ),
+                await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req),
                 guard.sanitized_prompt,
                 tier,
             )
@@ -352,9 +365,7 @@ class GatewayEngine:
                 tier = ModelTier.TIER_2_CLOUD
                 reason = f"{reason}->ESCALATED_SCHEMA_FAIL"
                 esc_res = _normalize_result(
-                    await asyncio.to_thread(
-                        self.backend_fn, guard.sanitized_prompt, tier, req.require_json, req.required_keys
-                    ),
+                    await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req),
                     guard.sanitized_prompt,
                     tier,
                 )
@@ -402,14 +413,139 @@ class GatewayEngine:
         self._write_trace(resp)
         return resp
 
+    async def stream_async(self, req: ChatRequest):
+        """Async generator yielding (delta_text, final_ChatResponse_or_None) with true upstream streaming."""
+        t0 = time.perf_counter()
+        guard = inspect_input(req.prompt)
+        if guard.blocked:
+            resp = ChatResponse(
+                status="blocked",
+                answer="Request blocked by security guardrail.",
+                block_reason=guard.block_reason,
+                latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+            )
+            self._write_trace(resp)
+            yield "", resp
+            return
 
-app = FastAPI(title="AI Ops Gateway", version="0.3.0")
+        decision = route_request(guard.sanitized_prompt, require_json=req.require_json)
+        tier = req.force_tier or decision.tier
+        reason = "FORCED_TIER" if req.force_tier else decision.reason
+
+        if tier == ModelTier.TIER_0_RULE and decision.deterministic_answer is not None:
+            resp = ChatResponse(
+                status="ok",
+                answer=decision.deterministic_answer,
+                tier_used=tier.value,
+                route_reason=reason,
+                pii_redacted=guard.pii_redacted,
+                latency_ms=round((time.perf_counter() - t0) * 1000, 3),
+            )
+            self._write_trace(resp)
+            yield decision.deterministic_answer, resp
+            return
+
+        if isinstance(self.backend_fn, CachedLiveBackend):
+            loop = asyncio.get_running_loop()
+            q: asyncio.Queue = asyncio.Queue()
+            collected: List[str] = []
+            usage_totals = {"prompt_tokens": 0, "completion_tokens": 0}
+
+            def _worker() -> None:
+                try:
+                    if tier == ModelTier.TIER_1_LOCAL_7B:
+                        it = stream_ollama(
+                            guard.sanitized_prompt,
+                            model=self.backend_fn.ollama_model,
+                            require_json=req.require_json,
+                            required_keys=req.required_keys,
+                            messages=req.messages,
+                            temperature=req.temperature,
+                            max_tokens=req.max_tokens,
+                        )
+                    else:
+                        it = stream_gemini(
+                            guard.sanitized_prompt,
+                            model=self.backend_fn.gemini_model,
+                            require_json=req.require_json,
+                            required_keys=req.required_keys,
+                            messages=req.messages,
+                            temperature=req.temperature,
+                            max_tokens=req.max_tokens,
+                        )
+                    for piece, u in it:
+                        if piece:
+                            loop.call_soon_threadsafe(q.put_nowait, ("chunk", piece))
+                        if u:
+                            usage_totals["prompt_tokens"] = u.get("prompt_tokens", usage_totals["prompt_tokens"])
+                            usage_totals["completion_tokens"] = u.get("completion_tokens", usage_totals["completion_tokens"])
+                    loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+                except Exception as exc:
+                    loop.call_soon_threadsafe(q.put_nowait, ("err", f"{type(exc).__name__}:{exc}"))
+
+            threading.Thread(target=_worker, daemon=True).start()
+            while True:
+                kind, payload = await q.get()
+                if kind == "chunk":
+                    collected.append(payload)
+                    clean_piece, _ = inspect_output(payload)
+                    yield clean_piece, None
+                elif kind == "err":
+                    resp = ChatResponse(
+                        status="error",
+                        answer=payload,
+                        tier_used=tier.value,
+                        route_reason=reason,
+                        pii_redacted=guard.pii_redacted,
+                        latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+                    )
+                    self._write_trace(resp)
+                    yield "", resp
+                    return
+                else:
+                    break
+
+            full_text, out_pii = inspect_output("".join(collected))
+            p_tok = usage_totals["prompt_tokens"] or max(20, len(guard.sanitized_prompt) // 3)
+            c_tok = usage_totals["completion_tokens"] or max(20, len(full_text) // 3)
+            cost = ((p_tok + c_tok) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
+            resp = ChatResponse(
+                status="ok",
+                answer=full_text,
+                tier_used=tier.value,
+                route_reason=reason,
+                pii_redacted=sorted(set(guard.pii_redacted + out_pii)),
+                prompt_tokens=p_tok,
+                completion_tokens=c_tok,
+                tokens_estimated=p_tok + c_tok,
+                cost_usd=round(cost, 6),
+                latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+            )
+            self._write_trace(resp)
+            yield "", resp
+            return
+
+        # Simulator / custom non-streaming backend: execute & stream incremental word chunks
+        resp = await self.handle_async(req)
+        if resp.status != "ok":
+            yield "", resp
+            return
+        text = resp.answer or ""
+        step = 24
+        for i in range(0, len(text), step):
+            yield text[i : i + step], None
+            await asyncio.sleep(0)
+        yield "", resp
+
+
+app = FastAPI(title="AI Ops Gateway", version="0.4.0")
 _live_mode = os.environ.get("AI_OPS_LIVE", "").strip() == "1"
 _max_local = int(os.environ.get("AI_OPS_MAX_LOCAL_CONCURRENCY", "2"))
 _engine = GatewayEngine(live=_live_mode, max_local_concurrency=_max_local)
 _metrics = GatewayMetrics()
+_quota = TenantQuotaManager()
 
-app.include_router(create_openai_router(lambda: _engine, _metrics))
+app.include_router(create_openai_router(lambda: _engine, _metrics, quota_manager=_quota))
 
 
 @app.get("/health")

@@ -71,7 +71,7 @@ At `N=6`, cloud overflow kept P95 flat at **2.49 s** (-83.0% vs. 14.66 s serial 
 git clone https://github.com/frankzhao-io/ai-ops-gateway.git
 cd ai-ops-gateway
 
-# Unit and regression tests (offline mock backend, 12 tests)
+# Unit and regression tests (offline mock backend, 17 tests)
 python -m pytest -v
 
 # Offline CI smoke run (writes dashboard/eval-data.js)
@@ -86,6 +86,10 @@ python -m src.run_concurrency_bench
 ### OpenAI-Compatible API & Docker Deployment
 
 Start the FastAPI gateway locally (simulator mode by default, or set `AI_OPS_LIVE=1` for live Ollama + Gemini):
+
+- **True SSE Streaming & Multi-Turn**: `stream=True` streams incremental tokens from Ollama (`/api/chat` NDJSON) and Gemini (`:streamGenerateContent?alt=sse`), preserving `system`/`user`/`assistant` roles and forwarding `temperature`/`max_tokens`.
+- **Multi-Tenant Auth, RPM & Budget Caps**: Set `AI_OPS_AUTH_ENABLED=1` and `AI_OPS_API_KEYS='[{"key":"sk-team-a","name":"team-a","rpm_limit":60,"budget_usd":5.0}]'` to enforce per-key bearer auth, sliding-window rate limits, and USD budget caps (exposed in `GET /metrics`).
+- **Semantic Difficulty Router**: Zero-dependency TF-IDF + char-ngram cosine-similarity router (`src/semantic_router.py`) catches short, high-complexity reasoning prompts without relying solely on length or keywords.
 
 ```powershell
 uvicorn src.gateway:app --host 0.0.0.0 --port 8000

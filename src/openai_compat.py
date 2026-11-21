@@ -9,10 +9,11 @@ import uuid
 from collections import Counter
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from src.auth_quota import TenantQuotaManager
 from src.router import ModelTier
 
 
@@ -88,11 +89,18 @@ def _extract_text(content: Union[str, List[Dict[str, Any]]]) -> str:
 
 
 def build_prompt_from_messages(messages: List[OpenAIMessage]) -> str:
-    """Preserve single-user prompt verbatim so Tier-0 deterministic routing works cleanly."""
-    if len(messages) == 1 and messages[0].role == "user":
-        return _extract_text(messages[0].content).strip()
+    """Extract the latest user prompt for routing while keeping full messages[] for backends."""
+    for m in reversed(messages):
+        if m.role == "user":
+            txt = _extract_text(m.content).strip()
+            if txt:
+                return txt
     lines = [f"{m.role}: {_extract_text(m.content)}" for m in messages]
     return "\n".join(lines).strip()
+
+
+def normalize_messages(messages: List[OpenAIMessage]) -> List[Dict[str, str]]:
+    return [{"role": m.role, "content": _extract_text(m.content)} for m in messages]
 
 
 def resolve_force_tier(model_name: str) -> Optional[ModelTier]:
@@ -175,7 +183,11 @@ async def stream_openai_chunks(resp: Any, completion_id: str, created: int) -> A
     yield "data: [DONE]\n\n"
 
 
-def create_openai_router(get_engine_fn: Callable[[], Any], metrics: GatewayMetrics) -> APIRouter:
+def create_openai_router(
+    get_engine_fn: Callable[[], Any],
+    metrics: GatewayMetrics,
+    quota_manager: Optional[TenantQuotaManager] = None,
+) -> APIRouter:
     router = APIRouter()
 
     @router.get("/v1/models")
@@ -192,11 +204,34 @@ def create_openai_router(get_engine_fn: Callable[[], Any], metrics: GatewayMetri
 
     @router.get("/metrics")
     def get_metrics() -> Dict[str, Any]:
-        return metrics.snapshot()
+        snap = metrics.snapshot()
+        if quota_manager is not None:
+            snap["tenants"] = quota_manager.snapshot()
+        return snap
 
     @router.post("/v1/chat/completions")
-    async def chat_completions(req: OpenAIChatCompletionRequest) -> Any:
+    async def chat_completions(
+        req: OpenAIChatCompletionRequest,
+        authorization: Optional[str] = Header(default=None),
+    ) -> Any:
         from src.gateway import ChatRequest
+
+        tenant_name = "anonymous"
+        if quota_manager is not None:
+            api_key = TenantQuotaManager.extract_bearer_key(authorization)
+            q = quota_manager.check_and_reserve(api_key)
+            if not q.allowed:
+                return JSONResponse(
+                    status_code=q.status_code,
+                    content={
+                        "error": {
+                            "message": q.message,
+                            "type": q.error_type,
+                            "code": q.error_code,
+                        }
+                    },
+                )
+            tenant_name = q.tenant_name
 
         prompt = build_prompt_from_messages(req.messages)
         if not prompt:
@@ -205,18 +240,86 @@ def create_openai_router(get_engine_fn: Callable[[], Any], metrics: GatewayMetri
                 content={"error": {"message": "Empty prompt in messages.", "type": "invalid_request_error", "code": "empty_prompt"}},
             )
 
-        require_json = bool(
-            req.response_format and req.response_format.get("type") == "json_object"
-        )
+        fmt_type = req.response_format.get("type") if req.response_format else None
+        require_json = fmt_type in ("json_object", "json_schema")
         gw_req = ChatRequest(
             prompt=prompt,
+            messages=normalize_messages(req.messages),
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
             require_json=require_json,
             required_keys=req.required_keys,
             force_tier=resolve_force_tier(req.model),
             allow_escalation=req.allow_escalation,
         )
+
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+        created = int(time.time())
+
+        if req.stream:
+            engine = get_engine_fn()
+            stream_gen = engine.stream_async(gw_req)
+            try:
+                first_piece, first_resp = await stream_gen.__anext__()
+            except StopAsyncIteration:
+                first_piece, first_resp = "", None
+
+            if first_resp is not None and first_resp.status == "blocked":
+                metrics.record(first_resp)
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": first_resp.answer,
+                            "type": "guardrail_blocked",
+                            "code": first_resp.block_reason,
+                        }
+                    },
+                )
+
+            async def sse_events() -> AsyncIterator[str]:
+                first_evt = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": "ai-ops-gateway",
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": first_piece}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(first_evt, ensure_ascii=False)}\n\n"
+                final_resp = first_resp
+                if final_resp is None:
+                    async for piece, resp_obj in stream_gen:
+                        if piece:
+                            evt = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": "ai-ops-gateway",
+                                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+                        if resp_obj is not None:
+                            final_resp = resp_obj
+                if final_resp is not None:
+                    metrics.record(final_resp)
+                    if quota_manager is not None:
+                        quota_manager.record_spend(tenant_name, final_resp.cost_usd)
+                end_evt = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": (final_resp.tier_used if final_resp else None) or "ai-ops-gateway",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(end_evt, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(sse_events(), media_type="text/event-stream")
+
         resp = await get_engine_fn().handle_async(gw_req)
         metrics.record(resp)
+        if quota_manager is not None:
+            quota_manager.record_spend(tenant_name, resp.cost_usd)
 
         if resp.status == "blocked":
             return JSONResponse(
@@ -241,13 +344,6 @@ def create_openai_router(get_engine_fn: Callable[[], Any], metrics: GatewayMetri
                 },
             )
 
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-        created = int(time.time())
-        if req.stream:
-            return StreamingResponse(
-                stream_openai_chunks(resp, completion_id, created),
-                media_type="text/event-stream",
-            )
         return to_openai_response(resp, completion_id, created)
 
     return router
