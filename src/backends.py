@@ -189,7 +189,12 @@ def call_gemini(
             resp.raise_for_status()
             data = resp.json()
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            candidates = data.get("candidates") or []
+            parts = candidates[0].get("content", {}).get("parts") or [] if candidates else []
+            text = "".join(p.get("text", "") for p in parts)
+            if not text:
+                last_err = "EMPTY_RESPONSE"
+                continue
             usage = data.get("usageMetadata", {})
             return BackendResult(
                 text=text,

@@ -216,6 +216,13 @@ def create_openai_router(
     ) -> Any:
         from src.gateway import ChatRequest
 
+        prompt = build_prompt_from_messages(req.messages)
+        if not prompt:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "Empty prompt in messages.", "type": "invalid_request_error", "code": "empty_prompt"}},
+            )
+
         tenant_name = "anonymous"
         if quota_manager is not None:
             api_key = TenantQuotaManager.extract_bearer_key(authorization)
@@ -232,13 +239,6 @@ def create_openai_router(
                     },
                 )
             tenant_name = q.tenant_name
-
-        prompt = build_prompt_from_messages(req.messages)
-        if not prompt:
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"message": "Empty prompt in messages.", "type": "invalid_request_error", "code": "empty_prompt"}},
-            )
 
         fmt_type = req.response_format.get("type") if req.response_format else None
         require_json = fmt_type in ("json_object", "json_schema")
@@ -278,32 +278,47 @@ def create_openai_router(
                 )
 
             async def sse_events() -> AsyncIterator[str]:
+                first_model = (first_resp.tier_used if first_resp else None) or "ai-ops-gateway"
                 first_evt = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": "ai-ops-gateway",
+                    "model": first_model,
                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": first_piece}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(first_evt, ensure_ascii=False)}\n\n"
                 final_resp = first_resp
-                if final_resp is None:
-                    async for piece, resp_obj in stream_gen:
-                        if piece:
-                            evt = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": "ai-ops-gateway",
-                                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
-                            }
-                            yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
-                        if resp_obj is not None:
-                            final_resp = resp_obj
-                if final_resp is not None:
-                    metrics.record(final_resp)
-                    if quota_manager is not None:
-                        quota_manager.record_spend(tenant_name, final_resp.cost_usd)
+                try:
+                    if final_resp is None:
+                        async for piece, resp_obj in stream_gen:
+                            if piece:
+                                evt = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": "ai-ops-gateway",
+                                    "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+                            if resp_obj is not None:
+                                final_resp = resp_obj
+                    if final_resp is not None:
+                        metrics.record(final_resp)
+                        if quota_manager is not None:
+                            quota_manager.record_spend(tenant_name, final_resp.cost_usd)
+                        if final_resp.status == "error":
+                            err_evt = {"error": {"message": final_resp.answer, "type": "backend_error", "code": "upstream_error"}}
+                            yield f"data: {json.dumps(err_evt, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                except Exception as exc:
+                    err_evt = {"error": {"message": f"{type(exc).__name__}: {exc}", "type": "stream_error", "code": "stream_failed"}}
+                    yield f"data: {json.dumps(err_evt, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                finally:
+                    await stream_gen.aclose()
+
                 end_evt = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",

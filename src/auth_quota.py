@@ -33,16 +33,25 @@ def load_policies_from_env() -> List[TenantPolicy]:
     raw = os.environ.get("AI_OPS_API_KEYS", "").strip()
     if not raw:
         return []
-    items = json.loads(raw)
-    return [
-        TenantPolicy(
-            key=str(item["key"]),
-            name=str(item.get("name", f"tenant-{idx}")),
-            rpm_limit=int(item.get("rpm_limit", 60)),
-            budget_usd=float(item.get("budget_usd", 10.0)),
+    try:
+        items = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(items, list):
+        return []
+    policies: List[TenantPolicy] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict) or not item.get("key"):
+            continue
+        policies.append(
+            TenantPolicy(
+                key=str(item["key"]),
+                name=str(item.get("name", f"tenant-{idx}")),
+                rpm_limit=int(item.get("rpm_limit", 60)),
+                budget_usd=float(item.get("budget_usd", 10.0)),
+            )
         )
-        for idx, item in enumerate(items)
-    ]
+    return policies
 
 
 class TenantQuotaManager:
@@ -71,8 +80,8 @@ class TenantQuotaManager:
         if not authorization:
             return ""
         parts = authorization.strip().split(None, 1)
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            return parts[1].strip()
+        if parts[0].lower() == "bearer":
+            return parts[1].strip() if len(parts) == 2 else ""
         return authorization.strip()
 
     def check_and_reserve(self, api_key: Optional[str], now: Optional[float] = None) -> QuotaCheckResult:
@@ -93,7 +102,8 @@ class TenantQuotaManager:
             if policy is None:
                 return QuotaCheckResult(allowed=True, tenant_name="anonymous")
 
-            spent = self._spent_usd[policy.name]
+            bucket = policy.key
+            spent = self._spent_usd[bucket]
             if spent >= policy.budget_usd:
                 return QuotaCheckResult(
                     allowed=False,
@@ -101,10 +111,10 @@ class TenantQuotaManager:
                     error_type="insufficient_quota",
                     error_code="budget_exceeded",
                     message=f"Tenant '{policy.name}' exceeded USD budget (${spent:.4f} >= ${policy.budget_usd:.4f}).",
-                    tenant_name=policy.name,
+                    tenant_name=bucket,
                 )
 
-            win = self._windows[policy.name]
+            win = self._windows[bucket]
             cutoff = ts - self.window_seconds
             while win and win[0] <= cutoff:
                 win.popleft()
@@ -116,17 +126,17 @@ class TenantQuotaManager:
                     error_type="rate_limit_error",
                     error_code="rpm_limit_exceeded",
                     message=f"Tenant '{policy.name}' exceeded {policy.rpm_limit} RPM limit.",
-                    tenant_name=policy.name,
+                    tenant_name=bucket,
                 )
 
             win.append(ts)
-            return QuotaCheckResult(allowed=True, tenant_name=policy.name)
+            return QuotaCheckResult(allowed=True, tenant_name=bucket)
 
-    def record_spend(self, tenant_name: str, cost_usd: float) -> None:
-        if not tenant_name or tenant_name == "anonymous" or cost_usd <= 0:
+    def record_spend(self, tenant_key: str, cost_usd: float) -> None:
+        if not tenant_key or tenant_key == "anonymous" or cost_usd <= 0:
             return
         with self._lock:
-            self._spent_usd[tenant_name] += float(cost_usd)
+            self._spent_usd[tenant_key] += float(cost_usd)
 
     def snapshot(self) -> Dict[str, Any]:
         ts = time.monotonic()
@@ -134,13 +144,13 @@ class TenantQuotaManager:
         with self._lock:
             out: Dict[str, Any] = {}
             for p in self._policies.values():
-                win = self._windows[p.name]
+                win = self._windows[p.key]
                 while win and win[0] <= cutoff:
                     win.popleft()
                 out[p.name] = {
                     "rpm_used": len(win),
                     "rpm_limit": p.rpm_limit,
-                    "spent_usd": round(self._spent_usd[p.name], 6),
+                    "spent_usd": round(self._spent_usd[p.key], 6),
                     "budget_usd": p.budget_usd,
                 }
             return out

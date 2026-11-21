@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from src.auth_quota import TenantQuotaManager
 from src.backends import BackendResult, CachedLiveBackend, stream_gemini, stream_ollama
-from src.guardrails import inspect_input, inspect_output, strip_json_fences, validate_json_output
+from src.guardrails import GuardrailReport, inspect_input, inspect_output, strip_json_fences, validate_json_output
 from src.openai_compat import GatewayMetrics, create_openai_router
 from src.router import (
     TIER_BASE_LATENCY_MS,
@@ -112,14 +112,44 @@ class GatewayEngine:
         self._sem_loop: Optional[asyncio.AbstractEventLoop] = None
         self._trace_lock = threading.Lock()
 
-    def _call_backend(self, prompt: str, tier: ModelTier, req: ChatRequest) -> Any:
+    def _inspect_request(self, req: ChatRequest) -> tuple:
+        guard = inspect_input(req.prompt)
+        if guard.blocked:
+            return guard, None
+        pii = list(guard.pii_redacted)
+        sanitized_messages = None
+        if req.messages:
+            sanitized_messages = []
+            for m in req.messages:
+                content = m.get("content", "")
+                mg = inspect_input(content)
+                if mg.blocked:
+                    return GuardrailReport(blocked=True, block_reason=mg.block_reason), None
+                pii.extend(mg.pii_redacted)
+                sanitized_messages.append({"role": m.get("role", "user"), "content": mg.sanitized_prompt})
+        return (
+            GuardrailReport(
+                blocked=False,
+                pii_redacted=sorted(set(pii)),
+                sanitized_prompt=guard.sanitized_prompt,
+            ),
+            sanitized_messages,
+        )
+
+    def _call_backend(
+        self,
+        prompt: str,
+        tier: ModelTier,
+        req: ChatRequest,
+        sanitized_messages: Optional[List[Dict[str, str]]] = None,
+    ) -> Any:
         if isinstance(self.backend_fn, CachedLiveBackend):
             return self.backend_fn(
                 prompt,
                 tier,
                 req.require_json,
                 req.required_keys,
-                messages=req.messages,
+                messages=sanitized_messages if sanitized_messages is not None else req.messages,
                 temperature=req.temperature,
                 max_tokens=req.max_tokens,
             )
@@ -147,7 +177,7 @@ class GatewayEngine:
 
     def handle(self, req: ChatRequest) -> ChatResponse:
         t0 = time.perf_counter()
-        guard = inspect_input(req.prompt)
+        guard, sanitized_messages = self._inspect_request(req)
         if guard.blocked:
             resp = ChatResponse(
                 status="blocked",
@@ -175,26 +205,28 @@ class GatewayEngine:
             return resp
 
         res = _normalize_result(
-            self.backend_fn(guard.sanitized_prompt, tier, req.require_json, req.required_keys),
+            self._call_backend(guard.sanitized_prompt, tier, req, sanitized_messages),
             guard.sanitized_prompt,
             tier,
         )
         escalated = False
+        final_cached = res.cached
         total_p_tok = res.prompt_tokens
         total_c_tok = res.completion_tokens
         total_latency = res.latency_ms
         total_cost = ((total_p_tok + total_c_tok) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
 
         # Circuit breaker: if Tier-1 fails/times out, gracefully fall back to Tier-2
-        if res.error and tier == ModelTier.TIER_1_LOCAL_7B:
+        if res.error and tier == ModelTier.TIER_1_LOCAL_7B and req.allow_escalation:
             escalated = True
             tier = ModelTier.TIER_2_CLOUD
             reason = f"{reason}->FALLBACK_TIER1_ERROR"
             res = _normalize_result(
-                self.backend_fn(guard.sanitized_prompt, tier, req.require_json, req.required_keys),
+                self._call_backend(guard.sanitized_prompt, tier, req, sanitized_messages),
                 guard.sanitized_prompt,
                 tier,
             )
+            final_cached = res.cached
             total_p_tok += res.prompt_tokens
             total_c_tok += res.completion_tokens
             total_latency += res.latency_ms
@@ -221,7 +253,7 @@ class GatewayEngine:
                 tier = ModelTier.TIER_2_CLOUD
                 reason = f"{reason}->ESCALATED_SCHEMA_FAIL"
                 esc_res = _normalize_result(
-                    self.backend_fn(guard.sanitized_prompt, tier, req.require_json, req.required_keys),
+                    self._call_backend(guard.sanitized_prompt, tier, req, sanitized_messages),
                     guard.sanitized_prompt,
                     tier,
                 )
@@ -237,6 +269,7 @@ class GatewayEngine:
                     )
                     self._write_trace(resp)
                     return resp
+                final_cached = esc_res.cached
                 output = strip_json_fences(esc_res.text)
                 total_p_tok += esc_res.prompt_tokens
                 total_c_tok += esc_res.completion_tokens
@@ -258,7 +291,7 @@ class GatewayEngine:
             tokens_estimated=total_p_tok + total_c_tok,
             cost_usd=round(total_cost, 6),
             latency_ms=round(total_latency, 2),
-            cached=res.cached,
+            cached=final_cached,
         )
         self._write_trace(resp)
         return resp
@@ -266,7 +299,7 @@ class GatewayEngine:
     async def handle_async(self, req: ChatRequest) -> ChatResponse:
         """Async request handler with local GPU concurrency semaphore and cloud overflow."""
         t0 = time.perf_counter()
-        guard = inspect_input(req.prompt)
+        guard, sanitized_messages = self._inspect_request(req)
         if guard.blocked:
             resp = ChatResponse(
                 status="blocked",
@@ -315,7 +348,7 @@ class GatewayEngine:
 
         try:
             res = _normalize_result(
-                await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req),
+                await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req, sanitized_messages),
                 guard.sanitized_prompt,
                 tier,
             )
@@ -334,7 +367,7 @@ class GatewayEngine:
             tier = ModelTier.TIER_2_CLOUD
             reason = f"{reason}->FALLBACK_TIER1_ERROR"
             res = _normalize_result(
-                await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req),
+                await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req, sanitized_messages),
                 guard.sanitized_prompt,
                 tier,
             )
@@ -365,7 +398,7 @@ class GatewayEngine:
                 tier = ModelTier.TIER_2_CLOUD
                 reason = f"{reason}->ESCALATED_SCHEMA_FAIL"
                 esc_res = _normalize_result(
-                    await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req),
+                    await asyncio.to_thread(self._call_backend, guard.sanitized_prompt, tier, req, sanitized_messages),
                     guard.sanitized_prompt,
                     tier,
                 )
@@ -416,7 +449,7 @@ class GatewayEngine:
     async def stream_async(self, req: ChatRequest):
         """Async generator yielding (delta_text, final_ChatResponse_or_None) with true upstream streaming."""
         t0 = time.perf_counter()
-        guard = inspect_input(req.prompt)
+        guard, sanitized_messages = self._inspect_request(req)
         if guard.blocked:
             resp = ChatResponse(
                 status="blocked",
@@ -446,10 +479,30 @@ class GatewayEngine:
             return
 
         if isinstance(self.backend_fn, CachedLiveBackend):
-            loop = asyncio.get_running_loop()
+            overflowed = False
+            acquired_local = False
+            cur_loop = asyncio.get_running_loop()
+            if self._local_sem is None or self._sem_loop is not cur_loop:
+                self._local_sem = asyncio.Semaphore(self.max_local_concurrency)
+                self._sem_loop = cur_loop
+
+            if tier == ModelTier.TIER_1_LOCAL_7B:
+                try:
+                    await asyncio.wait_for(self._local_sem.acquire(), timeout=self.queue_timeout_sec)
+                    acquired_local = True
+                except asyncio.TimeoutError:
+                    if req.force_tier is None and req.allow_escalation:
+                        overflowed = True
+                        tier = ModelTier.TIER_2_CLOUD
+                        reason = f"{reason}->OVERFLOW_CLOUD_QUEUE_FULL"
+                    else:
+                        await self._local_sem.acquire()
+                        acquired_local = True
+
             q: asyncio.Queue = asyncio.Queue()
             collected: List[str] = []
             usage_totals = {"prompt_tokens": 0, "completion_tokens": 0}
+            active_messages = sanitized_messages if sanitized_messages is not None else req.messages
 
             def _worker() -> None:
                 try:
@@ -459,7 +512,7 @@ class GatewayEngine:
                             model=self.backend_fn.ollama_model,
                             require_json=req.require_json,
                             required_keys=req.required_keys,
-                            messages=req.messages,
+                            messages=active_messages,
                             temperature=req.temperature,
                             max_tokens=req.max_tokens,
                         )
@@ -469,43 +522,61 @@ class GatewayEngine:
                             model=self.backend_fn.gemini_model,
                             require_json=req.require_json,
                             required_keys=req.required_keys,
-                            messages=req.messages,
+                            messages=active_messages,
                             temperature=req.temperature,
                             max_tokens=req.max_tokens,
                         )
                     for piece, u in it:
                         if piece:
-                            loop.call_soon_threadsafe(q.put_nowait, ("chunk", piece))
+                            cur_loop.call_soon_threadsafe(q.put_nowait, ("chunk", piece))
                         if u:
                             usage_totals["prompt_tokens"] = u.get("prompt_tokens", usage_totals["prompt_tokens"])
                             usage_totals["completion_tokens"] = u.get("completion_tokens", usage_totals["completion_tokens"])
-                    loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+                    cur_loop.call_soon_threadsafe(q.put_nowait, ("done", None))
                 except Exception as exc:
-                    loop.call_soon_threadsafe(q.put_nowait, ("err", f"{type(exc).__name__}:{exc}"))
+                    cur_loop.call_soon_threadsafe(q.put_nowait, ("err", f"{type(exc).__name__}:{exc}"))
 
             threading.Thread(target=_worker, daemon=True).start()
-            while True:
-                kind, payload = await q.get()
-                if kind == "chunk":
-                    collected.append(payload)
-                    clean_piece, _ = inspect_output(payload)
-                    yield clean_piece, None
-                elif kind == "err":
-                    resp = ChatResponse(
-                        status="error",
-                        answer=payload,
-                        tier_used=tier.value,
-                        route_reason=reason,
-                        pii_redacted=guard.pii_redacted,
-                        latency_ms=round((time.perf_counter() - t0) * 1000, 2),
-                    )
-                    self._write_trace(resp)
-                    yield "", resp
-                    return
-                else:
-                    break
+            pending = ""
+            redacted_pii = list(guard.pii_redacted)
+            try:
+                while True:
+                    kind, payload = await q.get()
+                    if kind == "chunk":
+                        collected.append(payload)
+                        pending += payload
+                        if len(pending) > 48:
+                            safe_prefix, out_pii = inspect_output(pending[:-48])
+                            redacted_pii.extend(out_pii)
+                            pending = pending[-48:]
+                            if safe_prefix:
+                                yield safe_prefix, None
+                    elif kind == "err":
+                        resp = ChatResponse(
+                            status="error",
+                            answer=payload,
+                            tier_used=tier.value,
+                            route_reason=reason,
+                            overflowed=overflowed,
+                            pii_redacted=sorted(set(redacted_pii)),
+                            latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+                        )
+                        self._write_trace(resp)
+                        yield "", resp
+                        return
+                    else:
+                        if pending:
+                            tail_clean, out_pii = inspect_output(pending)
+                            redacted_pii.extend(out_pii)
+                            if tail_clean:
+                                yield tail_clean, None
+                        break
+            finally:
+                if acquired_local:
+                    self._local_sem.release()
 
             full_text, out_pii = inspect_output("".join(collected))
+            redacted_pii.extend(out_pii)
             p_tok = usage_totals["prompt_tokens"] or max(20, len(guard.sanitized_prompt) // 3)
             c_tok = usage_totals["completion_tokens"] or max(20, len(full_text) // 3)
             cost = ((p_tok + c_tok) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
@@ -514,7 +585,8 @@ class GatewayEngine:
                 answer=full_text,
                 tier_used=tier.value,
                 route_reason=reason,
-                pii_redacted=sorted(set(guard.pii_redacted + out_pii)),
+                overflowed=overflowed,
+                pii_redacted=sorted(set(redacted_pii)),
                 prompt_tokens=p_tok,
                 completion_tokens=c_tok,
                 tokens_estimated=p_tok + c_tok,
