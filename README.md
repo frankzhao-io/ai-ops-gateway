@@ -8,12 +8,12 @@ The goal is practical: avoid sending arithmetic, malformed inputs, or routine ex
 
 ## How a request flows
 
-1. **Input checks (`src/guardrails.py`)**: Blocks common English/Chinese prompt-injection patterns and redacts PII/secrets (emails, phone numbers, Taiwan national IDs, `sk-`/`AIza` keys) before any model call. Short quoted phrases inside explanatory security questions are exempted unless they contain exfiltration verbs.
-2. **Routing (`src/router.py`)**:
+1. **Auth, Quotas & Input Guardrails (`src/auth_quota.py`, `src/guardrails.py`)**: Optional per-tenant Bearer API key validation, sliding-window RPM rate limiting, and USD budget caps (`AI_OPS_AUTH_ENABLED=1`). Every turn in `messages[]` (plus `prompt`) is scanned for English/Chinese prompt injections and redacted for PII/secrets (emails, phones, Taiwan IDs, `sk-`/`AIza` keys) before any model call.
+2. **Routing (`src/router.py`, `src/semantic_router.py`)**:
    - Pure arithmetic expressions go to an AST evaluator (`tier0_deterministic`, $0 cost).
-   - Prompts over 600 characters or matching complexity keywords route to `tier2_cloud_frontier`.
+   - Long prompts (`> 600` chars), complexity keywords, or semantically hard reasoning prompts scored by `SemanticDifficultyRouter` (zero-dependency TF-IDF + char-ngram cosine similarity) route to `tier2_cloud_frontier`.
    - Everything else starts on `tier1_local_7b`.
-3. **Fallback & output checks (`src/gateway.py`)**: If Ollama errors or times out, or if `require_json=True` validation still fails after stripping markdown code fences, the request falls back once to Tier-2. Model output is scanned again for leaked keys/PII before returning, and request metadata is appended to `data/traces.jsonl`.
+3. **Execution, True Streaming & Output Checks (`src/gateway.py`, `src/openai_compat.py`)**: Supports both sync/async JSON responses and true incremental SSE streaming (`stream_ollama` / `stream_gemini`) with GPU semaphore overflow, single-hop Tier-2 fallback, a 48-char streaming PII lookback buffer, and JSONL trace logging (`data/traces.jsonl`).
 
 ## Evaluation results
 
@@ -71,7 +71,7 @@ At `N=6`, cloud overflow kept P95 flat at **2.49 s** (-83.0% vs. 14.66 s serial 
 git clone https://github.com/frankzhao-io/ai-ops-gateway.git
 cd ai-ops-gateway
 
-# Unit and regression tests (offline mock backend, 17 tests)
+# Unit and regression tests (offline mock backend, 18 tests)
 python -m pytest -v
 
 # Offline CI smoke run (writes dashboard/eval-data.js)
