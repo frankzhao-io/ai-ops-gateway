@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from src.auth_quota import TenantQuotaManager
@@ -627,6 +628,11 @@ def health() -> Dict[str, Any]:
         "mode": "live" if _live_mode else "simulator",
         "max_local_concurrency": _max_local,
     }
+
+
+@app.get("/playground", include_in_schema=False)
+def playground() -> FileResponse:
+    return FileResponse(ROOT / "dashboard" / "playground.html")
 
 
 @app.post("/v1/chat", response_model=ChatResponse)

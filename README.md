@@ -85,7 +85,7 @@ python -m src.run_concurrency_bench
 
 ### OpenAI-Compatible API & Docker Deployment
 
-Start the FastAPI gateway locally (simulator mode by default, or set `AI_OPS_LIVE=1` for live Ollama + Gemini):
+Start the FastAPI gateway locally (simulator mode by default, or set `AI_OPS_LIVE=1` for live Ollama + Gemini) and open the interactive inspector at `http://localhost:8000/playground` (with `EN / 繁中` toggle) or Swagger UI at `http://localhost:8000/docs`:
 
 - **True SSE Streaming & Multi-Turn**: `stream=True` streams incremental tokens from Ollama (`/api/chat` NDJSON) and Gemini (`:streamGenerateContent?alt=sse`), preserving `system`/`user`/`assistant` roles and forwarding `temperature`/`max_tokens`.
 - **Multi-Tenant Auth, RPM & Budget Caps**: Set `AI_OPS_AUTH_ENABLED=1` and `AI_OPS_API_KEYS='[{"key":"sk-team-a","name":"team-a","rpm_limit":60,"budget_usd":5.0}]'` to enforce per-key bearer auth, sliding-window rate limits, and USD budget caps (exposed in `GET /metrics`).
