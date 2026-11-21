@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -104,11 +105,12 @@ class GatewayEngine:
         self.max_local_concurrency = max_local_concurrency
         self.queue_timeout_sec = queue_timeout_sec
         self._local_sem: Optional[asyncio.Semaphore] = None
+        self._sem_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._trace_lock = threading.Lock()
 
     def _write_trace(self, resp: ChatResponse) -> None:
         if not self.trace_path:
             return
-        self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "status": resp.status,
@@ -121,8 +123,10 @@ class GatewayEngine:
             "latency_ms": resp.latency_ms,
             "cached": resp.cached,
         }
-        with self.trace_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with self._trace_lock:
+            self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.trace_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def handle(self, req: ChatRequest) -> ChatResponse:
         t0 = time.perf_counter()
@@ -274,8 +278,10 @@ class GatewayEngine:
 
         overflowed = False
         acquired_local = False
-        if self._local_sem is None:
+        cur_loop = asyncio.get_running_loop()
+        if self._local_sem is None or self._sem_loop is not cur_loop:
             self._local_sem = asyncio.Semaphore(self.max_local_concurrency)
+            self._sem_loop = cur_loop
 
         if tier == ModelTier.TIER_1_LOCAL_7B:
             try:
@@ -303,6 +309,7 @@ class GatewayEngine:
                 self._local_sem.release()
 
         escalated = False
+        final_cached = res.cached
         total_p_tok = res.prompt_tokens
         total_c_tok = res.completion_tokens
         total_cost = ((total_p_tok + total_c_tok) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
@@ -318,6 +325,7 @@ class GatewayEngine:
                 guard.sanitized_prompt,
                 tier,
             )
+            final_cached = res.cached
             total_p_tok += res.prompt_tokens
             total_c_tok += res.completion_tokens
             total_cost += ((res.prompt_tokens + res.completion_tokens) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
@@ -350,11 +358,28 @@ class GatewayEngine:
                     guard.sanitized_prompt,
                     tier,
                 )
-                if not esc_res.error:
-                    output = strip_json_fences(esc_res.text)
-                    total_p_tok += esc_res.prompt_tokens
-                    total_c_tok += esc_res.completion_tokens
-                    total_cost += ((esc_res.prompt_tokens + esc_res.completion_tokens) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
+                total_p_tok += esc_res.prompt_tokens
+                total_c_tok += esc_res.completion_tokens
+                total_cost += ((esc_res.prompt_tokens + esc_res.completion_tokens) / 1000.0) * TIER_PRICING_PER_1K_TOKENS[tier]
+                if esc_res.error:
+                    resp = ChatResponse(
+                        status="error",
+                        answer=esc_res.error,
+                        tier_used=tier.value,
+                        route_reason=reason,
+                        escalated=escalated,
+                        overflowed=overflowed,
+                        pii_redacted=guard.pii_redacted,
+                        prompt_tokens=total_p_tok,
+                        completion_tokens=total_c_tok,
+                        tokens_estimated=total_p_tok + total_c_tok,
+                        cost_usd=round(total_cost, 6),
+                        latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+                    )
+                    self._write_trace(resp)
+                    return resp
+                final_cached = esc_res.cached
+                output = strip_json_fences(esc_res.text)
 
         output, out_pii = inspect_output(output)
         all_pii = sorted(set(guard.pii_redacted + out_pii))
@@ -372,7 +397,7 @@ class GatewayEngine:
             tokens_estimated=total_p_tok + total_c_tok,
             cost_usd=round(total_cost, 6),
             latency_ms=round((time.perf_counter() - t0) * 1000, 2),
-            cached=res.cached,
+            cached=final_cached,
         )
         self._write_trace(resp)
         return resp

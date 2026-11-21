@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from collections import Counter
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.router import ModelTier
@@ -32,9 +33,10 @@ class OpenAIChatCompletionRequest(BaseModel):
 
 
 class GatewayMetrics:
-    """Lightweight thread-safe/async-safe in-memory telemetry summary."""
+    """Thread-safe/async-safe in-memory telemetry summary."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.total_requests: int = 0
         self.blocked_requests: int = 0
         self.error_requests: int = 0
@@ -45,32 +47,34 @@ class GatewayMetrics:
         self.tier_counts: Counter[str] = Counter()
 
     def record(self, resp: Any) -> None:
-        self.total_requests += 1
-        if resp.status == "blocked":
-            self.blocked_requests += 1
-        elif resp.status == "error":
-            self.error_requests += 1
-        if resp.escalated:
-            self.escalated_requests += 1
-        if resp.overflowed:
-            self.overflowed_requests += 1
-        if resp.tier_used:
-            self.tier_counts[resp.tier_used] += 1
-        self.total_cost_usd += float(resp.cost_usd or 0.0)
-        self.total_latency_ms += float(resp.latency_ms or 0.0)
+        with self._lock:
+            self.total_requests += 1
+            if resp.status == "blocked":
+                self.blocked_requests += 1
+            elif resp.status == "error":
+                self.error_requests += 1
+            if resp.escalated:
+                self.escalated_requests += 1
+            if resp.overflowed:
+                self.overflowed_requests += 1
+            if resp.tier_used:
+                self.tier_counts[resp.tier_used] += 1
+            self.total_cost_usd += float(resp.cost_usd or 0.0)
+            self.total_latency_ms += float(resp.latency_ms or 0.0)
 
     def snapshot(self) -> Dict[str, Any]:
-        avg_lat = self.total_latency_ms / self.total_requests if self.total_requests else 0.0
-        return {
-            "total_requests": self.total_requests,
-            "blocked_requests": self.blocked_requests,
-            "error_requests": self.error_requests,
-            "escalated_requests": self.escalated_requests,
-            "overflowed_requests": self.overflowed_requests,
-            "total_cost_usd": round(self.total_cost_usd, 6),
-            "avg_latency_ms": round(avg_lat, 2),
-            "tier_counts": dict(self.tier_counts),
-        }
+        with self._lock:
+            avg_lat = self.total_latency_ms / self.total_requests if self.total_requests else 0.0
+            return {
+                "total_requests": self.total_requests,
+                "blocked_requests": self.blocked_requests,
+                "error_requests": self.error_requests,
+                "escalated_requests": self.escalated_requests,
+                "overflowed_requests": self.overflowed_requests,
+                "total_cost_usd": round(self.total_cost_usd, 6),
+                "avg_latency_ms": round(avg_lat, 2),
+                "tier_counts": dict(self.tier_counts),
+            }
 
 
 def _extract_text(content: Union[str, List[Dict[str, Any]]]) -> str:
@@ -95,11 +99,11 @@ def resolve_force_tier(model_name: str) -> Optional[ModelTier]:
     norm = (model_name or "auto").strip().lower()
     if norm in ("", "auto", "gateway", "ai-ops-gateway"):
         return None
-    if norm in ("tier-0", "tier_0", "tier_0_rule", "ast", "rule"):
+    if norm in ("tier-0", "tier-0-ast", "tier_0", "tier_0_rule", "tier0_deterministic", "ast", "rule"):
         return ModelTier.TIER_0_RULE
-    if norm in ("tier-1", "tier_1", "tier_1_local_7b", "local", "qwen2.5-coder:7b"):
+    if norm in ("tier-1", "tier-1-local-7b", "tier_1", "tier_1_local_7b", "tier1_local_7b", "local", "qwen2.5-coder:7b"):
         return ModelTier.TIER_1_LOCAL_7B
-    if norm in ("tier-2", "tier_2", "tier_2_cloud", "cloud", "gemini", "gemini-3.5-flash-lite"):
+    if norm in ("tier-2", "tier-2-cloud", "tier_2", "tier_2_cloud", "tier2_cloud_frontier", "cloud", "gemini", "gemini-3.5-flash-lite"):
         return ModelTier.TIER_2_CLOUD
     return None
 
@@ -196,7 +200,10 @@ def create_openai_router(get_engine_fn: Callable[[], Any], metrics: GatewayMetri
 
         prompt = build_prompt_from_messages(req.messages)
         if not prompt:
-            raise HTTPException(status_code=400, detail="Empty prompt in messages.")
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "Empty prompt in messages.", "type": "invalid_request_error", "code": "empty_prompt"}},
+            )
 
         require_json = bool(
             req.response_format and req.response_format.get("type") == "json_object"
@@ -212,18 +219,26 @@ def create_openai_router(get_engine_fn: Callable[[], Any], metrics: GatewayMetri
         metrics.record(resp)
 
         if resp.status == "blocked":
-            raise HTTPException(
+            return JSONResponse(
                 status_code=400,
-                detail={
-                    "message": resp.answer,
-                    "type": "guardrail_blocked",
-                    "code": resp.block_reason,
+                content={
+                    "error": {
+                        "message": resp.answer,
+                        "type": "guardrail_blocked",
+                        "code": resp.block_reason,
+                    }
                 },
             )
         if resp.status == "error":
-            raise HTTPException(
+            return JSONResponse(
                 status_code=502,
-                detail={"message": resp.answer, "type": "backend_error"},
+                content={
+                    "error": {
+                        "message": resp.answer,
+                        "type": "backend_error",
+                        "code": "upstream_error",
+                    }
+                },
             )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"

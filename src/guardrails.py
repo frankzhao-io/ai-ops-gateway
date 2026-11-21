@@ -15,7 +15,7 @@ PII_PATTERNS: List[Tuple[str, re.Pattern]] = [
 
 INJECTION_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("IGNORE_INSTRUCTIONS", re.compile(r"(?i)\b(ignore|disregard|forget)\b.{0,30}\b(previous|above|system)\b.{0,20}\b(instructions?|prompts?|rules?)\b")),
-    ("SYSTEM_EXFIL", re.compile(r"(?i)(reveal|print|dump|show)\s+(your\s+)?(system\s+prompt|api\s+key|secrets?|env)")),
+    ("SYSTEM_EXFIL", re.compile(r"(?i)(reveal|print|dump|show|output|leak)\s+(your\s+)?(hidden\s+|system\s+)?(prompt|instructions?|api\s+key|secrets?|env)")),
     ("ZH_OVERRIDE", re.compile(r"(忽略|無視|覆蓋)(?:之前|上面|系統|所有)+(?:的)?(指令|規則|設定)")),
 ]
 
@@ -61,6 +61,8 @@ def detect_prompt_injection(text: str) -> Optional[str]:
     """
     is_meta_query = bool(BENIGN_META_CONTEXT.search(text))
     unquoted_text = QUOTED_SPAN.sub(_exempt_safe_quote, text) if is_meta_query else text
+    if is_meta_query and EXFIL_PAYLOAD.search(unquoted_text):
+        unquoted_text = text
 
     for rule_name, pattern in INJECTION_PATTERNS:
         if pattern.search(unquoted_text):

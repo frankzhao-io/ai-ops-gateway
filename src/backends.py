@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,6 +155,7 @@ class CachedLiveBackend:
         self.ollama_model = ollama_model
         self.gemini_model = gemini_model
         self.use_cache = use_cache
+        self._lock = threading.Lock()
         self._cache: Dict[str, BackendResult] = {}
         if self.use_cache and self.cache_path.exists():
             for line in self.cache_path.read_text(encoding="utf-8").splitlines():
@@ -184,8 +186,10 @@ class CachedLiveBackend:
 
     def __call__(self, prompt: str, tier: ModelTier, require_json: bool, required_keys: Optional[List[str]]) -> BackendResult:
         key = self._make_key(prompt, tier, require_json, required_keys)
-        if self.use_cache and key in self._cache:
-            return self._cache[key]
+        if self.use_cache:
+            with self._lock:
+                if key in self._cache:
+                    return self._cache[key]
 
         if tier == ModelTier.TIER_1_LOCAL_7B:
             res = call_ollama(prompt, model=self.ollama_model, require_json=require_json, required_keys=required_keys)
@@ -193,7 +197,6 @@ class CachedLiveBackend:
             res = call_gemini(prompt, model=self.gemini_model, require_json=require_json, required_keys=required_keys)
 
         if self.use_cache and not res.error:
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             record = {
                 "key": key,
                 "tier": tier.value,
@@ -202,13 +205,16 @@ class CachedLiveBackend:
                 "completion_tokens": res.completion_tokens,
                 "latency_ms": res.latency_ms,
             }
-            with self.cache_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self._cache[key] = BackendResult(
+            cached_res = BackendResult(
                 text=res.text,
                 prompt_tokens=res.prompt_tokens,
                 completion_tokens=res.completion_tokens,
                 latency_ms=res.latency_ms,
                 cached=True,
             )
+            with self._lock:
+                self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.cache_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                self._cache[key] = cached_res
         return res
